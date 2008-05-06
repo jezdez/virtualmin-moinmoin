@@ -4,6 +4,8 @@
 # Changelog
 # 
 # 0.1 - initial release
+# 0.2 - now uses <Location> instead of ScriptAlias directives for
+#       compatibility reasons (a.k.a don't destroy other install scripts).
 
 # script_moinmoin_desc()
 sub script_moinmoin_desc
@@ -25,6 +27,11 @@ return "Advanced, easy to use and extensible WikiEngine with a large community o
 sub script_moinmoin_versions
 {
 return ( "1.6.3" );
+}
+
+sub script_moinmoin_category
+{
+return "Wiki";
 }
 
 sub script_moinmoin_python_modules
@@ -168,6 +175,8 @@ if ($?) {
 	return (0, "MoinMoin install failed : ".
 		   "<pre>".&html_escape($out)."</pre>");
 	}
+local $staticpath = $opts->{'path'} eq "/" ?
+	"/static" : "$opts->{'path'}/static";
 if (!$upgrade) {
 	local $share = $opts->{'dir'}."/share/moin";
 	local $wikiconfig = $share."/config/wikiconfig.py";
@@ -205,13 +214,13 @@ if (!$upgrade) {
 		  $l = "    sitename = u'$opts->{'wikiname'}'";
 		  }
 	  if ($l =~ /url_prefix_static\s*=/) {
-		  $l = "    url_prefix_static = '/moin_static'";
+		  $l = "    url_prefix_static = '$staticpath'";
 		  }
 	  if ($l =~ /page_front_page\s*=/) {
 		  $l = "    page_front_page = u'FrontPage'";
 		  }
 	  if ($l =~ /logo_string\s*=/) {
-		  $l = "    logo_string = u'<img src=\"/moin_static/common/moinmoin.png\" alt=\"MoinMoin Logo\">'";
+		  $l = "    logo_string = u'<img src=\"$staticpath/common/moinmoin.png\" alt=\"MoinMoin Logo\">'";
 		  }
 	  $i++;
 	  }
@@ -227,7 +236,7 @@ if (!$upgrade) {
 		&print_tempfile(WRAPPER, "from MoinMoin.server.server_fastcgi import FastCgiConfig, run\n");
 		&print_tempfile(WRAPPER, "class Config(FastCgiConfig):\n");
 		&print_tempfile(WRAPPER, "    logPath = '$d->{'home'}/logs/moin.log'\n");
-		&print_tempfile(WRAPPER, "    properties = {}\n");
+		&print_tempfile(WRAPPER, "    properties = {'script_name': '$opts->{'path'}'}\n");
 		&print_tempfile(WRAPPER, "run(Config)\n");
 		&close_tempfile(WRAPPER);
 		&set_ownership_permissions($d->{'uid'}, $d->{'ugid'}, 0755, $wrapper);
@@ -242,42 +251,30 @@ foreach my $port (@ports) {
 	local ($virt, $vconf) = &get_apache_virtual($d->{'dom'}, $port);
 	next if (!$virt);
 	local @sa = &apache::find_directive("Alias", $vconf);
-	local @sam = &apache::find_directive("ScriptAliasMatch", $vconf);
-	local ($robots) = grep { $_ =~ /^\/robots.txt/ } @sa;
-	if (!$robots) {
-		push(@sa, "/robots.txt $htdocs/robots.txt");
-		&apache::save_directive("Alias", \@sa,
-					$vconf, $conf);
-		}
-	local ($favicon) = grep { $_ =~ /^\/favicon.ico/ } @sa;
-	if (!$favicon) {
-		push(@sa, "/favicon.ico $htdocs/favicon.ico");
-		&apache::save_directive("Alias", \@sa,
-					$vconf, $conf);
-		}
-	local ($static) = grep { $_ =~ /^\/moin_static/ } @sa;
+	local ($static) = grep { $_ =~ /$staticpath/ } @sa;
 	if (!$static) {
-		push(@sa, "/moin_static $htdocs");
-		&apache::save_directive("Alias", \@sa,
-					$vconf, $conf);
-		}
-	local ($msam) = grep { $_ =~ /^\$opts->{'path'}/ } @sam;
-	if (!$msam) {
-		push(@sam, "^$opts->{'path'}(.*) $opts->{'dir'}/moin.fcgi/\$1");
-		&apache::save_directive("ScriptAliasMatch", \@sam,
-					$vconf, $conf);
+		push(@sa, "$staticpath $htdocs");
+		&apache::save_directive("Alias", \@sa, $vconf, $conf);
 		}
 	local @locs = &apache::find_directive_struct("Location", $vconf);
 	local ($loc) = grep { $_->{'words'}->[0] eq $opts->{'path'} } @locs;
 	next if ($loc);
+	local $reldir = $opts->{'dir'};
+	$reldir =~ s/^\Q$d->{'home'}\/\E//;
 	local $loc = { 'name' => 'Location',
 			   'value' => $opts->{'path'},
 			   'type' => 1,
 			   'members' => [
 			{ 'name' => 'AddHandler',
 			  'value' => 'fcgid-script .fcgi' },
-			{ 'name' => 'Options',
-			  'value' => 'ExecCGI' },
+			{ 'name' => 'RewriteEngine',
+			  'value' => 'On' },
+			{ 'name' => 'RewriteCond',
+			  'value' => '%{REQUEST_FILENAME} !-f' },
+			{ 'name' => 'RewriteCond',
+			  'value' => '%{REQUEST_FILENAME} !moin.fcgi' },
+			{ 'name' => 'RewriteRule',
+			  'value' => "$reldir(.*) moin.fcgi/\$1 [L]" },
 			]
 		};
 	&apache::save_directive_struct(undef, $loc, $vconf, $conf);
@@ -298,12 +295,12 @@ return (1, "Initial MoinMoin installation complete. Go to <a target=_new href='$
 sub script_moinmoin_uninstall
 {
 local ($d, $version, $opts) = @_;
-
 # Remove the contents of the target directory
 local $derr = &delete_script_install_directory($d, $opts);
 return (0, $derr) if ($derr);
-
-# Remove <Location> block, Alias and ScriptAliasMatch directives
+local $staticpath = $opts->{'path'} eq "/" ?
+	"/static" : "$opts->{'path'}/static";
+# Remove <Location> and Alias directives
 &require_apache();
 local $conf = &apache::get_config();
 local @ports = ( $d->{'web_port'},
@@ -315,30 +312,19 @@ foreach my $port (@ports) {
 	local ($loc) = grep { $_->{'words'}->[0] eq $opts->{'path'} } @locs;
 	if ($loc) {
 		&apache::save_directive_struct($loc, undef, $vconf, $conf);
+		&flush_file_lines($virt->{'file'});
 	}
 	local @sa = &apache::find_directive("Alias", $vconf);
-	local ($robots) = grep { $_ =~ /^\/robots.txt/ } @sa;
-	if ($robots) {
-		&apache::save_directive("Alias", undef, $vconf, $conf);
-		}
-	local ($favicon) = grep { $_ =~ /^\/favicon.ico/ } @sa;
-	if ($favicon) {
-		&apache::save_directive("Alias", undef, $vconf, $conf);
-		}
-	local ($static) = grep { $_ =~ /^\/moin_static/ } @sa;
-	if ($static) {
-		&apache::save_directive("Alias", undef, $vconf, $conf);
-		}
-	local @sam = &apache::find_directive("ScriptAliasMatch", $vconf);
-	local ($msam) = grep { $_ =~ /moin.fcgi/ } @sam;
-	if ($msam) {
-		&apache::save_directive("ScriptAliasMatch", undef, $vconf, $conf);
+	local @oldsa = @sa;
+	@sa = grep { !/$staticpath/ } @sa;
+	&apache::save_directive("Alias", \@sa, $vconf, $conf);
+	if (scalar(@oldsa) != scalar(@sa)) {
+		&flush_file_lines($virt->{'file'});
 		}
 	}
-	&flush_file_lines($virt->{'file'});
 &register_post_action(\&restart_apache);
 
-return (1, "MoinMoin directory and tables deleted.");
+return (1, "MoinMoin directory deleted.");
 }
 
 # script_moinmoin_latest(version)
